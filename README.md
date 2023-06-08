@@ -35,7 +35,7 @@ data in terms of AUC measures.
 
 ## Step 2 - Build up churn models
 
-- Notebook ([html](https://rpubs.com/JungsikNoh/1052036), [pdf](/notebooks/buildingChurnPredictionModel_part2.pdf)  )
+- Notebook ([html](https://rpubs.com/JungsikNoh/ChurnPredictionModel_Part2), [pdf](/notebooks/buildingChurnPredictionModel_part2.pdf)  )
 
 #### 2-1. Preliminary logistic regression with all the features (model name: lr_full)
 #### 2-2. Logistic regression after including squared continuous features (model name: lr_full2)
@@ -48,7 +48,7 @@ data in terms of AUC measures.
 
 ## Step 3 - Generate churn predictions for test data
 
-- Notebook ([html](https://rpubs.com/JungsikNoh/1052033), [pdf](/notebooks/buildingChurnPredictionModel_part3.pdf)  )
+- Notebook ([html](https://rpubs.com/JungsikNoh/CustomerChurnPredictionModel_Part3), [pdf](/notebooks/buildingChurnPredictionModel_part3.pdf)  )
 
 #### 3-1. Apply the same data cleaning done to train data for test data
 #### 3-2. Impute missing values of numerical features using k-nearest neighbor (knn) method as in train data
