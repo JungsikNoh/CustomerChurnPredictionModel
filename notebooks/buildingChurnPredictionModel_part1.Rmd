@@ -1,0 +1,412 @@
+---
+title: "Insurance Customer Churn Prediction Model (Part 1)"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE, message=FALSE, warning=FALSE, paged.print=TRUE, echo=TRUE)
+```
+
+## Introduction
+
+A churn model, also known as a customer attrition model, is a predictive model used by businesses to identify customers who are likely to discontinue using the products or services. 
+It helps businesses take proactive measures to retain customers and mitigate the negative impact of churn.
+
+Here I demonstrate the steps of building up a churn prediction model using a synthetic insurance customer dataset that mimic real-world dirty data. The train data contains a binary target variable (0: staying, 1: churn) and 100 de-identified features for 40K customers. 
+After building a binary classifier, I will generate churn predictions for 10K customers in the test data.
+
+As a modeling strategy, I will consider 5 candidate feature sets that are chosen using logistic regression with LASSO penalty. For each candidate feature sets, I will apply logistic regression, multilayer perceptron, random forest, and decision tree models, searching for an optimal model showing the best prediction performance in the validation data in terms of AUC measures.
+
+
+### Load packages
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+library(tidyverse) 
+library(tictoc)
+library(pheatmap)
+library(moments) 
+library(impute)
+library(pROC)
+library(caret)
+library(sparklyr)
+library(glmnet)
+library(tensorflow)
+library(keras)
+```
+
+
+## Step 1 - Clean and prepare data
+
+### 1-1. Glimpse of raw data
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=TRUE}
+## Load raw csv files
+raw_train <- read_csv(file.path('churnPrediction_train.csv')) 
+raw_test <- read_csv(file.path('churnPrediction_test.csv'))
+head(raw_train)
+```
+
+
+
+### 1-2. Sanity check and basic data cleaning for train data
+
+- For simplicity, data cleaning outcomes are suppressed. 
+- Here, detailed steps include:
+  - Check variable types, and fix any incorrect types if necessary
+  - Remove features having >80% of missing values
+  - Remove features with only one value
+  - Sanity check for factor levels, and fix any incorrect levels if necessary
+  - Check the number of NAs in columns and rows
+  - Check the number of unique elements of features
+
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE, echo=TRUE, results=FALSE}
+# Check variable types
+tmp <- raw_train %>% select(where(is.double))
+str(tmp) 
+tmp2 <- raw_train %>% select(where(is.character))
+str(tmp2)            # Need to correct x7, x19
+
+# Check if types of all the features are either character or double
+(ncol(tmp) + ncol(tmp2) == ncol(raw_train))       # TRUE
+
+# Correct x7 (%-scale to numeric) and x19 (remove '$' at the front and convert 
+# to numeric)
+raw_train_clean <- raw_train
+new_x7 <- as.numeric(sub("%", "", raw_train$x7)) / 100
+head(new_x7)
+raw_train_clean$x7 <- new_x7
+new_x19 <- as.numeric(sub("\\$", "", raw_train$x19))
+head(new_x19)
+raw_train_clean$x19 <- new_x19
+
+# Remove features having >80% of missing values
+(numNAs <- apply(is.na(raw_train_clean), 2, sum) / nrow(raw_train_clean))
+sort(numNAs, decreasing=T)[1:20]            
+# 3 features with >80% missing: x44, x57, x30
+indic <- which(numNAs > 0.8)
+colnames_tooManyNA <- colnames(raw_train_clean)[indic]
+colnames_tooManyNA
+raw_train_clean <- raw_train_clean %>% select(-any_of(colnames_tooManyNA))
+
+# Remove features with only one value
+(numUniqueEle <- apply(raw_train_clean, 2, function(x) length(unique(na.omit(x)))) )
+colnames_onlyOneValue <- colnames(raw_train_clean)[numUniqueEle == 1]
+colnames_onlyOneValue                       
+raw_train_clean %>% select(all_of(colnames_onlyOneValue))       
+# x39 = '5-10 miles', x99 = yes 
+raw_train_clean <- raw_train_clean %>% select(-any_of(colnames_onlyOneValue))
+
+# A list of removed features from the beginning that will be applied to the test data
+(colnames_toBeRemoved <- c(colnames_tooManyNA, colnames_onlyOneValue))
+
+# Sanity check for factor levels
+tmp3 <- raw_train_clean %>% select(where(is.character))
+sapply(tmp3, table, useNA = 'ifany')          
+
+# Two observations here.
+# (1) x3 (day) levels are mixed with abbreviations.
+# (2) 3 features (gender, state, manufacturer) have
+# significant portions of NAs. For those, I assign an 'Missing' level.
+# The others are fine.
+
+# (1) Correct x3 (day) factor levels
+raw_train_clean <- raw_train_clean %>%
+  mutate(x3 = fct_recode(x3, Monday = 'Mon', Tuesday = 'Tue', Wednesday = 'Wed', 
+                         Thursday = 'Thur', Friday = 'Fri', Saturday = 'Sat', 
+                         Sunday = 'Sun'))
+table(raw_train_clean$x3)  
+
+# (2) Assign a 'Missing' label to NAs in the 3 features (gender, state, manufacturer)
+(colnames_FactorWithNA <- colnames(tmp3)[apply(is.na(tmp3), 2, any)])
+raw_train_clean2 <- raw_train_clean %>% 
+  mutate(across(colnames_FactorWithNA, function(x) fct_explicit_na(x, na_level='Missing')))  
+
+# Check cleaned factors 
+tmp4 <- raw_train_clean2 %>% select(-where(is.numeric))
+sapply(tmp4, table, useNA = 'ifany')          
+
+# Check out after cleaning
+# Number of NAs in columns 
+print(raw_train_clean2, width=Inf)
+(numNAs <- apply(is.na(raw_train_clean2), 2, sum) / nrow(raw_train_clean2))
+sort(numNAs, decreasing=T)[1:20]                
+# Maximum percentage of NAs is ~44% which seems fine.
+
+# Number of NAs in rows to check if there are data points with too many missing values
+numNAs_row <- apply(is.na(raw_train_clean2), 1, sum) / ncol(raw_train_clean2)
+sort(numNAs_row, decreasing=T)[1:20]            
+# Maximum percentage of NAs is ~17% which seems fine.
+
+# Number of unique elements of features
+(numUniqueEle <- apply(raw_train_clean2, 2, function(x) length(unique(na.omit(x)))) )
+sort(numUniqueEle)
+
+# Here x59, x79, x98 are found to be binary, but annotated as double. 
+
+# Make them categorical
+raw_train_clean2 <- raw_train_clean2 %>% mutate(across(c('x59', 'x79', 'x98'), as.factor))
+
+# Sanity check for factor levels for c('x59', 'x79', 'x98')
+tmp5 <- raw_train_clean2 %>% select(all_of(c('x59', 'x79', 'x98')))
+sapply(tmp5, table, useNA = 'ifany')   
+
+# Assign a 'Missing' label to NAs in x79 
+raw_train_clean2 <- raw_train_clean2 %>% 
+  mutate(x79 = fct_explicit_na(x79, na_level='Missing'))
+    
+# Check again cleaned factors 
+tmp6 <- raw_train_clean2 %>% select(-where(is.numeric))
+sapply(tmp6, table, useNA = 'ifany')      
+```
+
+
+- After cleaning, it has 95 features  + 1 binary response with n=40K.
+
+&nbsp;
+
+#### Check distributions of numeric features and consider the necessity of feature transformation
+
+
+```{r, results=FALSE}
+# Check scales of continuous features
+df_numeric <- raw_train_clean2 %>% select(where(is.numeric))
+summary(df_numeric)
+
+# Moments of numeric features
+cmean <- sapply(df_numeric, function(x) mean(x, na.rm=T))
+csd <- sapply(df_numeric, function(x) sd(x, na.rm=T))
+cmax <- sapply(df_numeric, function(x) max(x, na.rm=T))
+cmin <- sapply(df_numeric, function(x) min(x, na.rm=T))
+
+plot(log10(abs(cmean)), type='b')
+plot(log10(csd), type='b')
+```
+
+- Plots of column means and standard deviations show that the feature scales are
+ highly heterogeneous. 
+- Due to this, a scaled dataset will be fed into the next 
+ imputation, regression, and other prediction steps for computational stability.
+
+&nbsp;
+
+- Now I check if there are features having extremely abnormal distributions, 
+because they might cause computational instability or disrupt robust model fitting. 
+
+
+```{r, results=FALSE}
+(cols_tooExtremeMax <- colnames(df_numeric)[cmax > cmean + 10 * csd])
+# [1] "x21" "x32" "x35" "x67" "x71" "x73" "x75" "x84"
+(cols_tooExtremeMin <- colnames(df_numeric)[cmin < cmean - 10 * csd])
+# [1] "x71"
+
+# Because there are some features with extreme maxima or minima, I examine kurtosis. 
+# In fact, those features turned out to have very high kurtosis 
+# (the highest three kurtosis are 98, 67, 48).
+
+ckurtosis <- sapply(df_numeric, function(x) kurtosis(x, na.rm=T))
+sort(ckurtosis, decreasing = T)
+(cols_highKurtosis <- colnames(df_numeric)[ckurtosis > 10])
+# [1] "x21" "x32" "x35" "x58" "x67" "x71" "x75" "x84"
+
+# Examine those distributions with too high kurtosis.
+hist(raw_train_clean2$x58)
+hist(raw_train_clean2$x67)
+hist(raw_train_clean2$x71)
+hist(raw_train_clean2$x84)
+```
+
+
+- Above 4 features seem to be already imputed by mean or median.
+- Because most of high kurtosis features have both positive and negative values, 
+  I don't consider log-transformation for them. 
+- Later in logistic regression, I will check if those features are informative or not.
+- For now, no feature is transformed.
+
+
+### 1-3. Impute missing values of numerical features using k-nearest neighbor (knn) method
+
+- ```impute::impute.knn()``` provides fast imputation originally designed for microarray data.
+
+
+```{r, results=FALSE}
+indNAs <- (apply(is.na(raw_train_clean2), 2, sum) > 0)
+sum(indNAs)                             # 34 numerical features have NAs
+
+# Reorganize numeric features into two sets that have NAs and don't have NAs
+df_withNA <- raw_train_clean2 %>% select(where(function(x) any(is.na(x))))
+df_numFeaturesWithoutNA <- raw_train_clean2 %>% 
+  select(-where(function(x) any(is.na(x)))) %>%
+  select(where(is.numeric)) %>%
+  select(-'y')
+df_numFeatures <- bind_cols(df_withNA, df_numFeaturesWithoutNA)
+
+# I choose to feed scaled data for knn imputation because impute.knn() assumes
+# homogeneous scales across columns.
+
+df_numFeatures_sc <- scale(df_numFeatures)
+
+# Impute NAs in the scaled numeric dataset using k-nearest neighbor averaging (knn)
+tic()
+inputmat <- as.matrix(df_numFeatures_sc)
+knnout <- impute.knn(inputmat, k=5)
+toc(log=T)                                # 5.8 sec for 40K rows
+df_numFeatures_sc_imputed  <- as_tibble(knnout$data)
+
+# Impute NAs also for unscaled data just in case when it is needed.
+tic()
+inputmat <- as.matrix(df_numFeatures)
+knnout <- impute.knn(inputmat, k=5)
+toc(log=T)                                # 5.9 sec for 40K rows
+df_numFeatures_imputed  <- as_tibble(knnout$data)
+
+# Reorganize feature orders for easier inspection
+df_categorical <- raw_train_clean2 %>% select(-where(is.numeric))
+df_y <- raw_train_clean2 %>% select('y')
+dat_train_sc <- bind_cols(df_y, df_numFeatures_sc_imputed, df_categorical)   
+print(dat_train_sc, width=Inf)
+dat_train <- bind_cols(df_y, df_numFeatures_imputed, df_categorical)
+print(dat_train, width=Inf)
+```
+
+&nbsp;
+
+#### Simple visualization of continuous features
+
+
+```{r}
+# A heatmap of correlation matrix shows no strong pattern.
+pheatmap(cor(cbind(df_y, df_numFeatures_sc_imputed)), 
+         cluster_rows = T, cluster_cols = T, fontsize = 6)
+
+# Low-dimensional representation of numeric features using PCA
+pc <- princomp(df_numFeatures_sc_imputed)
+plot(pc)
+pc3 <- data.frame(pc$scores[, 1:3])
+ggplot(data = pc3, aes(x=Comp.1, y=Comp.2)) + 
+  geom_hex() + 
+  scale_fill_gradient(name = 'Count(log10)', trans = "log10") 
+ggplot(data = pc3, aes(x=Comp.1, y=Comp.3)) + 
+  geom_hex() + 
+  scale_fill_gradient(name = 'Count(log10)', trans = "log10") 
+```
+
+- PC plots show no interesting pattern. 
+
+
+&nbsp;
+
+#### Examine churn rates per level of categorical features
+
+
+```{r}
+mean(df_y$y)
+df_y_categorical <- bind_cols(df_y, df_categorical)
+```
+
+- Churn rates per weekday
+  - Fri~Sun churn rates are higher (>0.16), 
+  suggesting a mild 'weekend' effect on the insurance customer churn rates.
+  - Tuesday (17%) churn rate is the lowest (0.116).
+
+```{r}
+dftmp <- df_y_categorical %>% group_by(x3) %>% 
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY)) 
+print(dftmp)
+fig_churn_day <- dftmp %>% 
+  ggplot(aes(x = factor(x3, levels=c(x3)), y = meanY)) +
+  geom_col(fill='darkblue') + 
+  labs(title = 'Mild weekend effect in churn rates', 
+       x = 'Weekday', 
+       y = 'Churn rate')
+print(fig_churn_day)
+```
+
+
+- Churn rates per gender are similar.
+
+```{r}
+df_y_categorical %>% group_by(x24) %>%
+  summarize(meanY = mean(y))
+```
+
+
+- State-wide churn rates are quite varying.
+
+```{r}
+dftmp <- df_y_categorical %>% group_by(x33) %>% 
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY))
+print(dftmp, n=Inf)
+``` 
+
+
+- Churn rates per competitor are similar, 
+except that 'farmers' is lower and 'progressive' is higher than the average.
+
+```{r}
+df_y_categorical %>% group_by(x65) %>%
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY))
+```
+
+
+- Churn rates per manufacturer are similar
+
+```{r}
+df_y_categorical %>% group_by(x77) %>%
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY))
+```
+
+
+- x31_yes group (~15% of total) has a very low churn rate (0.08).
+
+```{r}
+df_y_categorical %>% group_by(x31) %>%
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY))                      
+```
+
+
+- Mar & Sep show slightly higher churn rates.
+
+```{r}
+df_y_categorical %>% group_by(x60) %>%            
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY))       
+```
+
+
+- x93_yes group (~11% of total) has a very low churn rate (0.07).
+
+```{r}
+df_y_categorical %>% group_by(x93) %>%
+  summarize(meanY = mean(y)) %>%
+  arrange(desc(meanY))                             
+```
+
+
+- The rest categorical features are little informative for the response. 
+
+```{r}
+df_y_categorical %>% group_by(x59) %>%
+  summarize(meanY = mean(y)) 
+
+# Mean resonse per x79
+df_y_categorical %>% group_by(x79) %>%
+  summarize(meanY = mean(y))
+
+# Mean resonse per x98
+df_y_categorical %>% group_by(x98) %>%
+  summarize(meanY = mean(y))
+
+# Save
+save(dat_train_sc, dat_train, df_y, df_numFeatures_sc_imputed, 
+     df_numFeatures_imputed, df_categorical, colnames_toBeRemoved,
+     file = 'dat_train_cleaned_imputed.rdata')
+```
+
+
+
