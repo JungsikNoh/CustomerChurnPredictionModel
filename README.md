@@ -62,8 +62,8 @@ data in terms of AUC measures.
 based on 100 features in a dataset with 40,000 customer records. I built two predictive models using R. One is a logistic regression model, and the other is a multilayer perceptron (or a neural network) model.
 
 - Through simple exploratory data analysis (EDA), two interesting categorical variables were identified to be useful to tell which customers will be loyal. 
-  - x31_yes group (~15% of total) has a very low churn rate (0.08).
-  - x93_yes group (~11% of total) has a very low churn rate (0.07).
+  - x31_yes group (~15% of total) has a significantly lower churn rate (0.08).
+  - x93_yes group (~11% of total) has a significantly lower churn rate (0.07).
 
 (Dash line denotes the overall churn rate.)
 > <img src="images/x31_barplot.png" width="30%"/> <img src="images/x93_barplot.png" width="30%"/> 
